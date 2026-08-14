@@ -592,7 +592,28 @@ ProxyClientBase<Interface, Impl>::ProxyClientBase(typename Interface::Client cli
         });
     }
     });
-    Sub::construct(*this);
+    // If construct() fails, run the cleanup functions before rethrowing,
+    // because ~ProxyClientBase will not run for an object whose constructor
+    // threw, and the connection would otherwise be leaked.
+    try {
+        Sub::construct(*this);
+    } catch (...) {
+        MP_LOG(*m_context.loop, Log::Debug) << "Cleaning up " << CxxTypeName(*this) << " " << this << " after construct() failure";
+        CleanupRun(m_context.cleanup_fns);
+        throw;
+    }
+
+    // If this client owns the connection, delete the connection on disconnect.
+    if (destroy_connection) {
+        m_context.loop->sync([&] {
+            EventLoop& loop = *m_context.loop;
+            Connection* connection = m_context.connection;
+            connection->onDisconnect([&loop, connection] {
+                MP_LOG(loop, Log::Warning) << "IPC client: unexpected network disconnect.";
+                delete connection;
+            });
+        });
+    }
 }
 
 template <typename Interface, typename Impl>
@@ -694,7 +715,7 @@ using ConnThread = ConnThreads::iterator;
 // inserted bool.
 std::tuple<ConnThread, bool> SetThread(GuardedRef<ConnThreads> threads, Connection* connection, const std::function<Thread::Client()>& make_thread);
 
-//! The thread_local ThreadContext g_thread_context struct provides information
+//! The thread_local ThreadContext struct (see CurrentThread()) provides information
 //! about individual threads and a way of communicating between them. Because
 //! it's a thread local struct, each ThreadContext instance is initialized by
 //! the thread that owns it.
@@ -832,6 +853,10 @@ kj::Promise<T> ProxyServer<Thread>::post(Fn&& fn)
 //! Given a stream, make a new ProxyClient object to send requests over it.
 //! Also create a new Connection object embedded in the client that is freed
 //! when the client is closed.
+//!
+//! If the init interface declares a construct() method, creating the client
+//! calls it, so this function may block making an IPC call and may throw if
+//! the call fails.
 template <typename InitInterface>
 std::unique_ptr<ProxyClient<InitInterface>> ConnectStream(EventLoop& loop, Stream stream)
 {
@@ -840,11 +865,6 @@ std::unique_ptr<ProxyClient<InitInterface>> ConnectStream(EventLoop& loop, Strea
     loop.sync([&] {
         connection = std::make_unique<Connection>(loop, kj::mv(stream));
         init_client = connection->m_rpc_system->bootstrap(ServerVatId().vat_id).castAs<InitInterface>();
-        Connection* connection_ptr = connection.get();
-        connection->onDisconnect([&loop, connection_ptr] {
-            MP_LOG(loop, Log::Warning) << "IPC client: unexpected network disconnect.";
-            delete connection_ptr;
-        });
     });
     return std::make_unique<ProxyClient<InitInterface>>(
         kj::mv(init_client), connection.release(), /* destroy_connection= */ true);
@@ -933,6 +953,26 @@ extern thread_local ThreadContext g_thread_context; // NOLINT(bitcoin-nontrivial
 // Silence nonstandard bitcoin tidy error "Variable with non-trivial destructor
 // cannot be thread_local" which should not be a problem on modern platforms, and
 // could lead to a small memory leak at worst on older ones.
+
+//! Return the current thread's ThreadContext.
+//!
+//! Why per-thread state is needed at all: libmultiprocess has no control over
+//! which threads the C++ application uses to call ProxyClient methods after
+//! the proxy objects are returned to it. The thread-mapping model (see
+//! "Thread Mapping" in doc/design.md) gives each application thread making
+//! IPC calls a dedicated server-side thread that executes its requests, so
+//! thread-local state and recursive mutexes work as expected across the
+//! process boundary and callbacks from the server run on the originating
+//! client thread. The client-side handles for those dedicated server threads
+//! (the ProxyClient<Thread> objects returned by ThreadMap.makeThread, stored
+//! per connection in the request_threads / callback_threads maps below) are
+//! state that must be keyed implicitly by the calling thread, and must be
+//! released when the client thread exits so the corresponding server threads
+//! are freed. A thread_local object is the C++ mechanism that provides both
+//! of these: per-thread storage plus a destructor that runs at thread exit
+//! (the C equivalent would be a pthread key destructor). This is why
+//! ThreadContext is thread_local and why its destructor is nontrivial.
+ThreadContext& CurrentThread();
 
 } // namespace mp
 

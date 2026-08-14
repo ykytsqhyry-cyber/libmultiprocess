@@ -10,9 +10,9 @@
 #include <fstream>
 #include <future>
 #include <iostream>
-#include <kj/async.h>
 #include <kj/common.h>
 #include <memory>
+#include <mp/proxy.h>
 #include <mp/proxy-io.h>
 #include <mp/util.h>
 #include <stdexcept>
@@ -55,6 +55,7 @@ int main(int argc, char** argv)
         loop.loop();
     });
     mp::EventLoop* loop = promise.get_future().get();
+    mp::EventLoopRef loop_ref{*loop};
 
     auto [printer_init, printer_pid] = Spawn(*loop, argv[0], "mpprinter");
     auto [calc_init, calc_pid] = Spawn(*loop, argv[0], "mpcalculator");
@@ -71,6 +72,7 @@ int main(int argc, char** argv)
     mp::WaitProcess(calc_pid);
     printer_init.reset();
     mp::WaitProcess(printer_pid);
+    loop_ref.reset();
     loop_thread.join();
     std::cout << "Bye!" << std::endl;
     return 0;
