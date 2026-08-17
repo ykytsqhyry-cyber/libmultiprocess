@@ -4,8 +4,11 @@
 
 #include <mp/util.h>
 
+#include <kj/common.h>
+#include <kj/debug.h>
 #include <kj/test.h>
 
+#include <cerrno>
 #include <chrono>
 #include <compare>
 #include <condition_variable>
@@ -13,17 +16,25 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <sys/wait.h>
 #include <thread>
+#include <tuple>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
+namespace mp {
+namespace test {
 namespace {
+
+constexpr auto FAILURE_TIMEOUT = std::chrono::seconds{30};
 
 // Poll for child process exit using waitpid(..., WNOHANG) until the child exits
 // or timeout expires. Returns true if the child exited and status_out was set.
 // Returns false on timeout or error.
-static bool WaitPidWithTimeout(int pid, std::chrono::milliseconds timeout, int& status_out)
+static bool WaitPidWithTimeout(ProcessId pid, std::chrono::milliseconds timeout, int& status_out)
 {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
@@ -84,19 +95,18 @@ KJ_TEST("SpawnProcess does not run callback in child")
         control_cv.notify_one();
     });
 
-    int pid{-1};
-    const int fd{mp::SpawnProcess(pid, [&](int child_fd) -> std::vector<std::string> {
+    const auto [pid, socket]{SpawnProcess([&](SpawnConnectInfo connect_info) -> std::vector<std::string> {
         // If this callback runs in the post-fork child, target_mutex appears
         // locked forever (the owning thread does not exist), so this deadlocks.
         std::lock_guard<std::mutex> g(target_mutex);
-        return {"true", std::to_string(child_fd)};
+        return {"true", std::move(connect_info)};
     })};
-    ::close(fd);
+    ::close(socket);
 
     int status{0};
-    // Give the child up to 1 second to exit. If it does not, terminate it and
+    // Give the child some time to exit. If it does not, terminate it and
     // reap it to avoid leaving a zombie behind.
-    const bool exited{WaitPidWithTimeout(pid, std::chrono::milliseconds{1000}, status)};
+    const bool exited{WaitPidWithTimeout(pid, FAILURE_TIMEOUT, status)};
     if (!exited) {
         ::kill(pid, SIGKILL);
         ::waitpid(pid, &status, /*options=*/0);
@@ -108,3 +118,18 @@ KJ_TEST("SpawnProcess does not run callback in child")
     KJ_EXPECT(exited, "Timeout waiting for child process to exit");
     KJ_EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
+
+KJ_TEST("SpawnProcess throws on execvp failure")
+{
+    try {
+        SpawnProcess([&](SpawnConnectInfo) -> std::vector<std::string> {
+            return {"/nonexistent/binary"};
+        });
+        KJ_EXPECT(false, "expected SpawnProcess to throw");
+    } catch (const std::system_error& e) {
+        KJ_EXPECT(e.code().value() == ENOENT);
+        KJ_EXPECT(std::string_view{e.what()}.find("execvp") != std::string_view::npos);
+    }
+}
+} // namespace test
+} // namespace mp

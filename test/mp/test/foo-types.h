@@ -13,16 +13,20 @@
 #include <cstddef>
 #include <mp/test/foo.capnp.h>
 #include <mp/type-context.h>
+#include <mp/type-data.h>
 #include <mp/type-decay.h>
 #include <mp/type-function.h>
 #include <mp/type-interface.h>
 #include <mp/type-map.h>
 #include <mp/type-message.h>
 #include <mp/type-number.h>
+#include <mp/type-optional.h>
+#include <mp/type-pointer.h>
 #include <mp/type-set.h>
 #include <mp/type-string.h>
 #include <mp/type-struct.h>
 #include <mp/type-threadmap.h>
+#include <mp/type-unordered-set.h>
 #include <mp/type-vector.h>
 #include <string>
 #include <type_traits>
@@ -42,6 +46,7 @@ void CustomBuildField(TypeList<FooCustom>, Priority<1>, InvokeContext& invoke_co
 {
     BuildField(TypeList<std::string>(), invoke_context, output, value.v1);
     output.setV2(value.v2);
+    BuildField(TypeList<std::vector<int>>(), invoke_context, output, value.v3);
 }
 
 template <typename Input, typename ReadDest>
@@ -51,10 +56,19 @@ decltype(auto) CustomReadField(TypeList<FooCustom>, Priority<1>, InvokeContext& 
     return read_dest.update([&](FooCustom& value) {
         value.v1 = ReadField(TypeList<std::string>(), invoke_context, mp::Make<mp::ValueField>(custom.getV1()), ReadDestTemp<std::string>());
         value.v2 = custom.getV2();
+        value.v3 = ReadField(TypeList<std::vector<int>>(), invoke_context, mp::Make<mp::ValueField>(custom.getV3()), ReadDestTemp<std::vector<int>>());
     });
 }
 
 } // namespace test
+
+template <typename Input>
+bool CustomHasField(TypeList<test::FooData>, InvokeContext& invoke_context, const Input& input)
+{
+    // Cap'n Proto C++ cannot distinguish null vs empty Data in List(Data), so
+    // interpret empty Data as null for this specific type.
+    return input.get().size() != 0;
+}
 
 inline void CustomBuildMessage(InvokeContext& invoke_context,
                         const test::FooMessage& src,

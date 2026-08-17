@@ -17,10 +17,16 @@ jobs:
         # Test all supported releases.
         # See https://www.netbsd.org/releases/.
         include:
-          - release: 9.4
-            capnproto-cppflags: 'CPPFLAGS="-DKJ_NO_EXCEPTIONS=0 -DKJ_USE_KQUEUE=0"'
-          - release: 10.1
+          # Due to a bug in Cap'n Proto, GCC compilers older
+          # than 14.x require `-DKJ_NO_EXCEPTIONS=0` when
+          # processing `capnproto/c++/src/kj/common.h`.
+          # See https://github.com/capnproto/capnproto/pull/2756/changes/28fa1a6753514d8de56875ec2222fa0e1c3a04f7.
+          - release: '10.1'
             capnproto-cppflags: 'CPPFLAGS="-DKJ_NO_EXCEPTIONS=0"'
+            env_vars: 'CXXFLAGS="-DKJ_NO_EXCEPTIONS=0"'
+          - release: '11.0'
+            capnproto-cppflags: 'CPPFLAGS="-DKJ_NO_EXCEPTIONS=0"'
+            env_vars: 'CXXFLAGS="-DKJ_NO_EXCEPTIONS=0"'
     steps:
       - uses: actions/checkout@v6
 
@@ -44,9 +50,9 @@ jobs:
               pkgsrc/devel/libtool-base \
               pkgsrc/devel/pkgconf \
               pkgsrc/devel/zlib \
-              `# gcc15 is referenced here because the pkgsrc framework requires lang/gcc15/version.mk to exist` \
+              `# gcc16 is referenced here because the pkgsrc framework requires lang/gcc16/version.mk to exist` \
               `# during the "make install" step below, even though we compile our project with gcc14.` \
-              pkgsrc/lang/gcc15 \
+              pkgsrc/lang/gcc16 \
               pkgsrc/mk \
               pkgsrc/pkgtools \
               pkgsrc/security/openssl \
@@ -63,7 +69,7 @@ jobs:
       - name: Run CI script
         run: |
           cd ${{ github.workspace }}
-          CI_CONFIG="ci/configs/netbsd.bash" bash ci/scripts/ci.sh
+          CI_CONFIG="ci/configs/netbsd.bash" ${{ matrix.env_vars }} bash ci/scripts/ci.sh
 
   build-openbsd:
     runs-on: ubuntu-latest
@@ -120,16 +126,21 @@ jobs:
         env:
           HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
         run: |
-          brew install --quiet ninja capnp
+          brew install --quiet ninja capnp llvm
 
       - name: Run CI script
         run: |
+          export PATH="$(brew --prefix llvm)/bin:$PATH"
           CI_CONFIG="ci/configs/macos.bash" bash ci/scripts/ci.sh
 
   build:
     runs-on: ubuntu-latest
 
     env:
+      NIXPKGS_CHANNEL: nixos-26.05
+      NIX_EXTRA_CONFIG: |
+        keep-env-derivations = true
+        keep-outputs = true
       NIX_EXTRA_CONFIG_ACT: |
         sandbox = false
         filter-syscalls = false
@@ -144,14 +155,33 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Determine CI configuration
+        id: config
+        env:
+          CI_CONFIG: ci/configs/${{ matrix.config }}.bash
+        run: ci/scripts/config.sh
+
       - name: Install Nix
         uses: cachix/install-nix-action@v31       # 2025-05-27, from https://github.com/cachix/install-nix-action/tags
         with:
-          nix_path: nixpkgs=channel:nixos-25.05   # latest release
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.config.outputs.nixpkgs_rev }}.tar.gz
           # Act executes inside an unprivileged container (Docker or Podman),
           # so KVM support isn't available.
           enable_kvm: "${{ github.actor != 'nektos/act' }}"
-          extra_nix_config: ${{ github.actor == 'nektos/act' && env.NIX_EXTRA_CONFIG_ACT || '' }}
+          extra_nix_config: |
+            ${{ env.NIX_EXTRA_CONFIG }}
+            ${{ github.actor == 'nektos/act' && env.NIX_EXTRA_CONFIG_ACT || '' }}
+
+      - name: Cache Nix store
+        if: steps.config.outputs.cache_nix_store == 'true'
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ matrix.config }}-${{ steps.config.outputs.nixpkgs_rev }}-${{ hashFiles('shell.nix', 'ci/patches/*.patch', format('ci/configs/{0}.bash', matrix.config)) }}
+          restore-prefixes-first-match: |
+            nix-${{ runner.os }}-${{ matrix.config }}-${{ steps.config.outputs.nixpkgs_rev }}-
+            nix-${{ runner.os }}-${{ matrix.config }}-
+            nix-${{ runner.os }}-
+          gc-max-store-size-linux: 10G
 
       - name: Run CI script
         env:

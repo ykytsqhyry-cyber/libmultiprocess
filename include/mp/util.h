@@ -5,23 +5,48 @@
 #ifndef MP_UTIL_H
 #define MP_UTIL_H
 
+#include <array>
 #include <capnp/schema.h>
 #include <cassert>
-#include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <functional>
+#include <kj/async-io.h>
+#include <kj/memory.h>
 #include <kj/string-tree.h>
 #include <mutex>
 #include <string>
 #include <tuple>
+#include <typeinfo>
 #include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#if __has_include(<cxxabi.h>)
+#include <cxxabi.h>
+#include <memory>
+#endif
+
 namespace mp {
 
 //! Generic utility functions used by capnp code.
+
+// std::cmp_less_equal/cmp_greater_equal only accept integer types (C++20 §[utility.intcmp]).
+// These wrappers fall back to regular comparison for floating-point types.
+template <typename A, typename B>
+constexpr bool safe_less_equal(A a, B b)
+{
+    if constexpr (std::is_floating_point_v<A> || std::is_floating_point_v<B>) return a <= b;
+    else return std::cmp_less_equal(a, b);
+}
+template <typename A, typename B>
+constexpr bool safe_greater_equal(A a, B b)
+{
+    if constexpr (std::is_floating_point_v<A> || std::is_floating_point_v<B>) return a >= b;
+    else return std::cmp_greater_equal(a, b);
+}
 
 //! Type holding a list of types.
 //!
@@ -84,6 +109,16 @@ using RemoveCvRef = std::remove_cv_t<std::remove_reference_t<T>>;
 template <typename T>
 using Decay = std::decay_t<T>;
 
+//! Concept satisfied when T's .get() method returns exactly type U.
+//! Used to constrain overloads that handle a specific capnp field type.
+template <typename T, typename U>
+concept FieldTypeIs = std::is_same_v<decltype(std::declval<T>().get()), U>;
+
+//! Concept satisfied when T's .get() method returns a capnp interface type
+//! (i.e., a type that exposes a nested ::Calls type in generated code).
+template <typename T>
+concept InterfaceField = requires { typename Decay<decltype(std::declval<T>().get())>::Calls; };
+
 //! SFINAE helper, see using Require below.
 template <typename SfinaeExpr, typename Result_>
 struct _Require
@@ -135,7 +170,10 @@ struct PtrOrValue {
     std::variant<T*, T> data;
 
     template <typename... Args>
-    PtrOrValue(T* ptr, Args&&... args) : data(ptr ? ptr : std::variant<T*, T>{std::in_place_type<T>, std::forward<Args>(args)...}) {}
+    PtrOrValue(T* ptr, Args&&... args) : data(std::in_place_type<T*>, ptr)
+    {
+        if (!ptr) data.template emplace<T>(std::forward<Args>(args)...);
+    }
 
     T& operator*() { return data.index() ? std::get<T>(data) : *std::get<T*>(data); }
     T* operator->() { return &**this; }
@@ -209,6 +247,41 @@ void Unlock(Lock& lock, Callback&& callback)
     callback();
 }
 
+//! Invoke a function and run a follow-up action before returning the original
+//! result.
+//!
+//! This can be used similarly to KJ_DEFER to run cleanup code, but works better
+//! if the cleanup function can throw because it avoids clang bug
+//! https://github.com/llvm/llvm-project/issues/12658 which skips calling
+//! destructors in that case and can lead to memory leaks. Also, if both
+//! functions throw, this lets one exception take precedence instead of
+//! terminating due to having two active exceptions.
+template <typename Fn, typename After>
+decltype(auto) TryFinally(Fn&& fn, After&& after)
+{
+    bool success{false};
+    using R = std::invoke_result_t<Fn>;
+    try {
+        if constexpr (std::is_void_v<R>) {
+            std::forward<Fn>(fn)();
+            success = true;
+            std::forward<After>(after)();
+            return;
+        } else {
+            decltype(auto) result = std::forward<Fn>(fn)();
+            success = true;
+            std::forward<After>(after)();
+            return result;
+        }
+    } catch (...) {
+        if (!success) std::forward<After>(after)();
+        throw;
+    }
+}
+
+//! Set the OS-level name of the current thread
+void SetOsThreadName(const char* name);
+
 //! Format current thread name as "{exe_name}-{$pid}/{thread_name}-{$tid}".
 std::string ThreadName(const char* exe_name);
 
@@ -216,31 +289,130 @@ std::string ThreadName(const char* exe_name);
 //! errors in python unit tests.
 std::string LogEscape(const kj::StringTree& string, size_t max_size);
 
+using Stream = kj::Own<kj::AsyncIoStream>;
+
+using ProcessId = int;
+using SocketId = int;
+constexpr SocketId SocketError{-1};
+
+//! Information about parent process passed to child process as a command-line
+//! argument. On unix this is the child socket fd number formatted as a string.
+using SpawnConnectInfo = std::string;
+
 //! Callback type used by SpawnProcess below.
-using FdToArgsFn = std::function<std::vector<std::string>(int fd)>;
+using SpawnConnectInfoToArgsFn = std::function<std::vector<std::string>(const SpawnConnectInfo&)>;
 
 //! Spawn a new process that communicates with the current process over a socket
-//! pair. Returns pid through an output argument, and file descriptor for the
-//! local side of the socket.
-//! The fd_to_args callback is invoked in the parent process before fork().
-//! It must not rely on child pid/state, and must return the command line
-//! arguments that should be used to execute the process. Embed the remote file
-//! descriptor number in whatever format the child process expects.
-int SpawnProcess(int& pid, FdToArgsFn&& fd_to_args);
+//! pair. Calls connect_info_to_args callback with a connection string that
+//! needs to be passed to the child process, and executes the argv command line
+//! it returns. Returns child process id and socket id.
+std::tuple<ProcessId, SocketId> SpawnProcess(SpawnConnectInfoToArgsFn&& connect_info_to_args);
 
-//! Call execvp with vector args.
-//! Not safe to call in a post-fork child of a multi-threaded process.
-//! Currently only used by mpgen at build time.
-void ExecProcess(const std::vector<std::string>& args);
+//! Initialize spawned child process using the SpawnConnectInfo string passed to it,
+//! returning a socket id for communicating with the parent process.
+SocketId StartSpawned(const SpawnConnectInfo& connect_info);
+
+//! Create a socket pair that can be used to communicate within a process or
+//! between parent and child processes.
+std::array<SocketId, 2> SocketPair();
+
+//! Start a process and return its process id. Caller should call WaitProcess
+//! on the returned id.
+ProcessId StartProcess(const std::vector<std::string>& args);
 
 //! Wait for a process to exit and return its exit code.
-int WaitProcess(int pid);
+int WaitProcess(ProcessId pid);
 
 inline char* CharCast(char* c) { return c; }
 inline char* CharCast(unsigned char* c) { return (char*)c; }
 inline const char* CharCast(const char* c) { return c; }
 inline const char* CharCast(const unsigned char* c) { return (const char*)c; }
 
+#if __has_include(<cxxabi.h>)   // GCC & Clang ─ use <cxxabi.h> to demangle
+inline std::string _demangle(const char* m)
+{
+    int status = 0;
+    std::unique_ptr<char, void(*)(void*)> p{
+        abi::__cxa_demangle(m, /*output_buffer=*/nullptr, /*length=*/nullptr, &status), std::free};
+    return (status == 0 && p) ? p.get() : m;   // fall back on mangled if needed
+}
+#else                           // MSVC or other ─ no demangling available
+inline std::string _demangle(const char* m) { return m; }
+#endif
+
+template<class T>
+std::string CxxTypeName(const T& /*unused*/)
+{
+#ifdef __cpp_rtti
+    return _demangle(typeid(std::decay_t<T>).name());
+#else
+    return "<type information unavailable without rtti>";
+#endif
+}
+
+//! Exception thrown from code executing an IPC call that is interrupted.
+struct InterruptException final : std::exception {
+    explicit InterruptException(std::string message) : m_message(std::move(message)) {}
+    const char* what() const noexcept override { return m_message.c_str(); }
+    std::string m_message;
+};
+
+class CancelProbe;
+
+//! Helper class that detects when a promise is canceled. Used to detect
+//! canceled requests and prevent potential crashes on unclean disconnects.
+//!
+//! In the future, this could also be used to support a way for wrapped C++
+//! methods to detect cancellation (like approach #4 in
+//! https://github.com/bitcoin/bitcoin/issues/33575).
+class CancelMonitor
+{
+public:
+    inline ~CancelMonitor();
+    inline void promiseDestroyed(CancelProbe& probe);
+
+    bool m_canceled{false};
+    std::function<void()> m_on_cancel;
+    CancelProbe* m_probe{nullptr};
+};
+
+//! Helper object to attach to a promise and update a CancelMonitor.
+class CancelProbe
+{
+public:
+    CancelProbe(CancelMonitor& monitor) : m_monitor(&monitor)
+    {
+        assert(!monitor.m_probe);
+        monitor.m_probe = this;
+    }
+    ~CancelProbe()
+    {
+        if (m_monitor) m_monitor->promiseDestroyed(*this);
+    }
+    CancelMonitor* m_monitor;
+};
+
+CancelMonitor::~CancelMonitor()
+{
+    if (m_probe) {
+        assert(m_probe->m_monitor == this);
+        m_probe->m_monitor = nullptr;
+        m_probe = nullptr;
+    }
+}
+
+void CancelMonitor::promiseDestroyed(CancelProbe& probe)
+{
+    // If promise is being destroyed, assume the promise has been canceled. In
+    // theory this method could be called when a promise was fulfilled or
+    // rejected rather than canceled, but it's safe to assume that's not the
+    // case because the CancelMonitor class is meant to be used inside code
+    // fulfilling or rejecting the promise and destroyed before doing so.
+    assert(m_probe == &probe);
+    m_canceled = true;
+    if (m_on_cancel) m_on_cancel();
+    m_probe = nullptr;
+}
 } // namespace mp
 
 #endif // MP_UTIL_H

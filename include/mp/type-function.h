@@ -48,20 +48,20 @@ struct ProxyCallFn
 };
 
 template <typename FnR, typename... FnParams, typename Input, typename ReadDest>
-decltype(auto) CustomReadField(TypeList<std::function<FnR(FnParams...)>>,
+decltype(auto) CustomReadField(TypeList<std::function<FnR(FnParams...)>> types,
     Priority<1>,
     InvokeContext& invoke_context,
     Input&& input,
     ReadDest&& read_dest)
 {
-    if (input.has()) {
+    if (CustomHasField(types, invoke_context, input)) {
         using Interface = typename Decay<decltype(input.get())>::Calls;
         auto client = std::make_shared<ProxyClient<Interface>>(
             input.get(), &invoke_context.connection, /* destroy_connection= */ false);
         return read_dest.construct(ProxyCallFn<decltype(client)>{std::move(client)});
     }
     return read_dest.construct();
-};
+}
 } // namespace mp
 
 #endif // MP_PROXY_TYPE_FUNCTION_H

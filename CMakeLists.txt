@@ -13,7 +13,7 @@ endif()
 include("cmake/compat_find.cmake")
 
 find_package(Threads REQUIRED)
-find_package(CapnProto 0.7 QUIET NO_MODULE)
+find_package(CapnProto 0.9 NO_MODULE)
  if(NOT CapnProto_FOUND)
    message(FATAL_ERROR
      "Cap'n Proto is required but was not found.\n"
@@ -35,9 +35,7 @@ set(CAPNPROTO_CLANG_INCOMPATIBLE FALSE)
 # https://github.com/capnproto/capnproto/blob/master/security-advisories/2022-11-30-0-pointer-list-bounds.md
 # https://capnproto.org/news/2022-11-30-CVE-2022-46149-security-advisory.html
 # https://dwrensha.github.io/capnproto-rust/2022/11/30/out_of_bounds_memory_access_bug.html
-if(CapnProto_VERSION STREQUAL "0.7.0"
-   OR CapnProto_VERSION STREQUAL "0.8.0"
-   OR CapnProto_VERSION STREQUAL "0.9.0"
+if(CapnProto_VERSION STREQUAL "0.9.0"
    OR CapnProto_VERSION STREQUAL "0.9.1"
    OR CapnProto_VERSION STREQUAL "0.10.0"
    OR CapnProto_VERSION STREQUAL "0.10.1"
@@ -90,13 +88,6 @@ if(MP_ENABLE_CLANG_TIDY)
     message(FATAL_ERROR "MP_ENABLE_CLANG_TIDY is ON but clang-tidy is not found.")
   endif()
   set(CMAKE_CXX_CLANG_TIDY "${CLANG_TIDY_EXECUTABLE}")
-
-  # Workaround for nix from https://gitlab.kitware.com/cmake/cmake/-/issues/20912#note_793338
-  # Nix injects header paths via $NIX_CFLAGS_COMPILE; CMake tags these as
-  # CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES and omits them from the compile
-  # database, so clang-tidy, which ignores $NIX_CFLAGS_COMPILE, can't find capnp
-  # headers. Setting them as standard passes them to clang-tidy.
-  set(CMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES ${CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES})
 endif()
 
 option(MP_ENABLE_IWYU "Run include-what-you-use with the compiler." OFF)
@@ -109,6 +100,15 @@ if(MP_ENABLE_IWYU)
   if(DEFINED ENV{IWYU_MAPPING_FILE})
     list(APPEND CMAKE_CXX_INCLUDE_WHAT_YOU_USE "-Xiwyu" "--mapping_file=$ENV{IWYU_MAPPING_FILE}")
   endif()
+endif()
+
+if(MP_ENABLE_CLANG_TIDY OR MP_ENABLE_IWYU)
+  # Workaround for nix from https://gitlab.kitware.com/cmake/cmake/-/issues/20912#note_793338
+  # Nix injects header paths via $NIX_CFLAGS_COMPILE; CMake tags these as
+  # CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES and omits them from the compile
+  # database, so clang-tidy, which ignores $NIX_CFLAGS_COMPILE, can't find capnp
+  # headers. Setting them as standard passes them to clang-tidy.
+  set(CMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES ${CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES})
 endif()
 
 include("cmake/compat_config.cmake")
@@ -137,6 +137,10 @@ configure_file(include/mp/config.h.in "${CMAKE_CURRENT_BINARY_DIR}/include/mp/co
 # Generated C++ Capn'Proto schema files
 capnp_generate_cpp(MP_PROXY_SRCS MP_PROXY_HDRS include/mp/proxy.capnp)
 set_source_files_properties("${MP_PROXY_SRCS}" PROPERTIES SKIP_LINTING TRUE) # Ignored before cmake 3.27
+# Build-graph node for generated headers. This lets targets that include
+# the headers order themselves after generation without depending on the
+# library target that also uses them.
+add_custom_target(mp_headers DEPENDS ${MP_PROXY_HDRS})
 
 # util library
 add_library(mputil OBJECT src/mp/util.cpp)
@@ -199,10 +203,20 @@ add_executable(Libmultiprocess::mpgen ALIAS mpgen)
 target_include_directories(mpgen PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>)
 target_include_directories(mpgen PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(mpgen PRIVATE CapnProto::capnp)
-target_link_libraries(mpgen PRIVATE CapnProto::capnp-rpc)
 target_link_libraries(mpgen PRIVATE CapnProto::capnpc)
 target_link_libraries(mpgen PRIVATE CapnProto::kj)
+target_link_libraries(mpgen PRIVATE CapnProto::kj-async)
 target_link_libraries(mpgen PRIVATE Threads::Threads)
+# Use CAPNP_EXECUTABLE/CAPNPC_CXX_EXECUTABLE cmake variables set by
+# CapnProtoConfig.cmake rather than reading the CapnProto::capnp_tool
+# IMPORTED_LOCATION directly. On Debian/Ubuntu, IMPORTED_LOCATION is broken
+# by a multiarch cmake packaging bug (see
+# https://github.com/bitcoin-core/libmultiprocess/issues/328), but
+# CapnProtoConfig.cmake works around it by hardcoding the correct paths. On
+# other platforms the variables hold generator expressions that
+# target_compile_definitions evaluates correctly at generation time.
+target_compile_definitions(mpgen PRIVATE CAPNP_EXECUTABLE=\"${CAPNP_EXECUTABLE}\")
+target_compile_definitions(mpgen PRIVATE CAPNPC_CXX_EXECUTABLE=\"${CAPNPC_CXX_EXECUTABLE}\")
 set_target_properties(mpgen PROPERTIES
     INSTALL_RPATH_USE_LINK_PATH TRUE)
 set_target_properties(mpgen PROPERTIES
